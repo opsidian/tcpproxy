@@ -306,7 +306,7 @@ func To(addr string) *DialProxy {
 // Resolver translates an address to one or more addresses
 type Resolver interface {
 	Addr() string
-	Resolve() (string, error)
+	Resolve(ctx context.Context) (string, error)
 }
 
 type staticResolver struct {
@@ -317,7 +317,7 @@ func (s staticResolver) Addr() string {
 	return s.addr
 }
 
-func (s staticResolver) Resolve() (string, error) {
+func (s staticResolver) Resolve(ctx context.Context) (string, error) {
 	return s.addr, nil
 }
 
@@ -328,19 +328,21 @@ type DNSSRVResolver struct {
 	cachedAddrs []string
 	cacheValid  time.Time
 	cacheLock   *sync.RWMutex
+	dnsResolver *net.Resolver
 }
 
 // NewDNSSRVResolver creates a new resolver which uses DNS SRV lookup
-func NewDNSSRVResolver(addr string, timeout time.Duration) *DNSSRVResolver {
+func NewDNSSRVResolver(addr string, timeout time.Duration, dnsResolver *net.Resolver) *DNSSRVResolver {
 	return &DNSSRVResolver{
-		addr:      addr,
-		timeout:   timeout,
-		cacheLock: &sync.RWMutex{},
+		addr:        addr,
+		timeout:     timeout,
+		cacheLock:   &sync.RWMutex{},
+		dnsResolver: dnsResolver,
 	}
 }
 
 // Resolve looks up the SRV record for the given address and returns the hosts
-func (d *DNSSRVResolver) Resolve() (string, error) {
+func (d *DNSSRVResolver) Resolve(ctx context.Context) (string, error) {
 	if time.Now().Before(d.cacheValid) {
 		return d.cachedAddrs[0], nil
 	}
@@ -348,7 +350,7 @@ func (d *DNSSRVResolver) Resolve() (string, error) {
 	d.cacheLock.Lock()
 	defer d.cacheLock.Unlock()
 
-	_, res, err := net.LookupSRV("", "", d.addr)
+	_, res, err := d.dnsResolver.LookupSRV(ctx, "", "", d.addr)
 	if err != nil {
 		if d.cachedAddrs != nil {
 			return d.cachedAddrs[0], err
@@ -431,7 +433,7 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 		ctx, cancel = context.WithTimeout(ctx, dp.dialTimeout())
 	}
 
-	addr, err := dp.AddrResolver.Resolve()
+	addr, err := dp.AddrResolver.Resolve(ctx)
 	if err != nil {
 		dp.onDialError()(src, err)
 		return

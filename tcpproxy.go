@@ -60,6 +60,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -297,7 +300,78 @@ type Target interface {
 
 // To is shorthand way of writing &tlsproxy.DialProxy{Addr: addr}.
 func To(addr string) *DialProxy {
-	return &DialProxy{Addr: addr}
+	return &DialProxy{AddrResolver: staticResolver{addr: addr}}
+}
+
+// Resolver translates an address to one or more addresses
+type Resolver interface {
+	Addr() string
+	Resolve() (string, error)
+}
+
+type staticResolver struct {
+	addr string
+}
+
+func (s staticResolver) Addr() string {
+	return s.addr
+}
+
+func (s staticResolver) Resolve() (string, error) {
+	return s.addr, nil
+}
+
+// DNSSRVResolver resolves the name via a DNS SRV lookup
+type DNSSRVResolver struct {
+	addr        string
+	timeout     time.Duration
+	cachedAddrs []string
+	cacheValid  time.Time
+	cacheLock   *sync.RWMutex
+}
+
+// NewDNSSRVResolver creates a new resolver which uses DNS SRV lookup
+func NewDNSSRVResolver(addr string, timeout time.Duration) *DNSSRVResolver {
+	return &DNSSRVResolver{
+		addr:      addr,
+		timeout:   timeout,
+		cacheLock: &sync.RWMutex{},
+	}
+}
+
+// Resolve looks up the SRV record for the given address and returns the hosts
+func (d *DNSSRVResolver) Resolve() (string, error) {
+	if time.Now().Before(d.cacheValid) {
+		return d.cachedAddrs[0], nil
+	}
+
+	d.cacheLock.Lock()
+	defer d.cacheLock.Unlock()
+
+	_, res, err := net.LookupSRV("", "", d.addr)
+	if err != nil {
+		if d.cachedAddrs != nil {
+			return d.cachedAddrs[0], err
+		}
+		return "", err
+	}
+
+	addrs := make([]string, len(res))
+	for i := 0; i < len(res); i++ {
+		host := strings.TrimRight(res[i].Target, ".")
+		port := strconv.FormatUint(uint64(res[i].Port), 10)
+		addrs[i] = host + ":" + port
+	}
+
+	d.cachedAddrs = addrs
+	d.cacheValid = time.Now().Add(d.timeout)
+
+	return d.cachedAddrs[0], nil
+}
+
+// Addr returns the original address
+func (d *DNSSRVResolver) Addr() string {
+	return d.addr
 }
 
 // DialProxy implements Target by dialing a new connection to Addr
@@ -306,7 +380,7 @@ func To(addr string) *DialProxy {
 // The To func is a shorthand way of creating a DialProxy.
 type DialProxy struct {
 	// Addr is the TCP address to proxy to.
-	Addr string
+	AddrResolver Resolver
 
 	// KeepAlivePeriod sets the period between TCP keep alives.
 	// If zero, a default is used. To disable, use a negative number.
@@ -356,7 +430,14 @@ func (dp *DialProxy) HandleConn(src net.Conn) {
 	if dp.DialTimeout >= 0 {
 		ctx, cancel = context.WithTimeout(ctx, dp.dialTimeout())
 	}
-	dst, err := dp.dialContext()(ctx, "tcp", dp.Addr)
+
+	addr, err := dp.AddrResolver.Resolve()
+	if err != nil {
+		dp.onDialError()(src, err)
+		return
+	}
+
+	dst, err := dp.dialContext()(ctx, "tcp", addr)
 	if cancel != nil {
 		cancel()
 	}
@@ -468,7 +549,7 @@ func (dp *DialProxy) onDialError() func(src net.Conn, dstDialErr error) {
 		return dp.OnDialError
 	}
 	return func(src net.Conn, dstDialErr error) {
-		log.Printf("tcpproxy: for incoming conn %v, error dialing %q: %v", src.RemoteAddr().String(), dp.Addr, dstDialErr)
+		log.Printf("tcpproxy: for incoming conn %v, error dialing %q: %v", src.RemoteAddr().String(), dp.AddrResolver.Addr(), dstDialErr)
 		src.Close()
 	}
 }
